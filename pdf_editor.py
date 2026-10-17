@@ -1,132 +1,74 @@
-"""
-PDF Last Page Remover
-
-This script processes PDF files in a specified input folder, removing the last page
-from each PDF and saving the modified versions in an output folder.
-
-It includes logging for tracking the process and a progress bar for visual feedback.
-"""
-
-import os
+"""Batch-remove the last page of PDFs without overwriting original files."""
+import argparse
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from PyPDF2 import PdfReader, PdfWriter
 from tqdm import tqdm
-import traceback
-from concurrent.futures import ThreadPoolExecutor
 
-# Setup logging configuration
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+log = logging.getLogger(__name__)
 
-def process_pdf(input_path: Path, output_path: Path) -> bool:
-    """
-    Remove the last page of the PDF and save it to the output path.
-
-    Args:
-        input_path (Path): Path to the input PDF file.
-        output_path (Path): Path where the modified PDF will be saved.
-
-    Returns:
-        bool: True if processing was successful, False otherwise.
-    """
+def process_pdf(source: Path, destination: Path) -> bool:
+    """Return True when a PDF with two or more pages was processed."""
     try:
-        with input_path.open('rb') as file:
-            pdf_reader = PdfReader(file)
-            pdf_writer = PdfWriter()
-
-            total_pages = len(pdf_reader.pages)
-
-            if total_pages < 2:
-                logging.warning(f"Skipping {input_path.name}: not enough pages to remove the last one.")
+        with source.open("rb") as stream:
+            reader = PdfReader(stream)
+            if len(reader.pages) < 2:
+                log.warning("Skipping %s: fewer than two pages", source.name)
                 return False
-
-            for page_num in range(total_pages - 1):
-                pdf_writer.add_page(pdf_reader.pages[page_num])
-
-            # Ensure the output file doesn't overwrite an existing file unless necessary
-            output_path = _ensure_unique_filename(output_path)
-
-            with output_path.open('wb') as output_file:
-                pdf_writer.write(output_file)
-
-        logging.info(f"Processed: {input_path.name}")
+            writer = PdfWriter()
+            for page in reader.pages[:-1]:
+                writer.add_page(page)
+            target = unique_filename(destination)
+            # Exclusive creation avoids silently replacing an existing output.
+            with target.open("xb") as output:
+                writer.write(output)
+        log.info("Saved %s", target)
         return True
-
-    except Exception as e:
-        logging.error(f"Failed to process {input_path.name}: {e}")
-        logging.exception(traceback.format_exc())  # Log full traceback for debugging
+    except Exception:
+        log.exception("Failed to process %s", source.name)
         return False
 
-def remove_last_page(input_folder: str, output_folder: str):
-    """
-    Iterate through all PDF files in the input folder and remove the last page.
-
-    Args:
-        input_folder (str): Path to the folder containing input PDF files.
-        output_folder (str): Path to the folder where modified PDFs will be saved.
-    """
-    input_folder_path = Path(input_folder)
-    output_folder_path = Path(output_folder)
-
-    # Create the output folder if it doesn't exist
-    output_folder_path.mkdir(parents=True, exist_ok=True)
-
-    # Get list of PDF files
-    pdf_files = list(input_folder_path.glob('*.pdf'))
-
-    # Setup progress bar
-    with tqdm(total=len(pdf_files), desc="Processing PDFs") as pbar:
-        with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(process_pdf, input_path, output_folder_path / f"edited_{input_path.name}") 
-                       for input_path in pdf_files]
-            for future in futures:
-                future.result()  # Will raise any exception thrown in threads
-                pbar.update(1) # Update progress bar regardless of success/failure
-
-#def remove_last_page(input_folder: str, output_folder: str):
-#    """
-#    Iterate through all PDF files in the input folder and remove the last page.
-
-#    Args:
-#        input_folder (str): Path to the folder containing input PDF files.
-#        output_folder (str): Path to the folder where modified PDFs will be saved.
-#    """
-#    input_folder_path = Path(input_folder)
-#    output_folder_path = Path(output_folder)
-
-#    # Create the output folder if it doesn't exist
-#    output_folder_path.mkdir(parents=True, exist_ok=True)
-
-#    # Get list of PDF files
-#    pdf_files = list(input_folder_path.glob('*.pdf'))
-    
-#    # Setup progress bar
-#    with tqdm(total=len(pdf_files), desc="Processing PDFs") as pbar:
-#        for input_path in pdf_files:
-#            output_path = output_folder_path / f"edited_{input_path.name}"
-#            process_pdf(input_path, output_path)
-#            pbar.update(1)  # Update progress bar regardless of success/failure
-
-    logging.info("All PDF files have been processed.")
-
-def _ensure_unique_filename(file_path: Path) -> Path:
-    """
-    Ensure the file name is unique by appending a number to the file name if needed.
-
-    Args:
-        file_path (Path): Original file path.
-
-    Returns:
-        Path: Modified file path with a unique name.
-    """
+def unique_filename(path: Path) -> Path:
+    candidate = path
     counter = 1
-    new_file_path = file_path
-    while new_file_path.exists():
-        new_file_path = file_path.with_stem(f"{file_path.stem}_{counter}")
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}_{counter}{path.suffix}")
         counter += 1
-    return new_file_path
+    return candidate
+
+def remove_last_page(input_folder: str, output_folder: str, workers: int = 4) -> tuple[int, int]:
+    source = Path(input_folder).expanduser().resolve()
+    destination = Path(output_folder).expanduser().resolve()
+    if not source.is_dir():
+        raise NotADirectoryError(f"Input folder does not exist: {source}")
+    if source == destination:
+        raise ValueError("Input and output folders must be different")
+    destination.mkdir(parents=True, exist_ok=True)
+    files = sorted(p for p in source.glob("*.pdf") if p.is_file())
+    successes = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(process_pdf, path, destination / f"edited_{path.name}") for path in files]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="PDFs"):
+            successes += int(future.result())
+    log.info("Finished: %s succeeded, %s skipped or failed", successes, len(files) - successes)
+    return successes, len(files) - successes
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input_folder", help="Directory of input PDF files")
+    parser.add_argument("output_folder", help="Directory for edited files")
+    parser.add_argument("--workers", type=int, default=4)
+    args = parser.parse_args()
+    if args.workers < 1 or args.workers > 16:
+        parser.error("--workers must be between 1 and 16")
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    try:
+        success, failed = remove_last_page(args.input_folder, args.output_folder, args.workers)
+        return 1 if failed else 0
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    return 2
 
 if __name__ == "__main__":
-    input_folder = "/path/to/your/input/folder"
-    output_folder = "/path/to/your/output/folder"
-    remove_last_page(input_folder, output_folder)
+    raise SystemExit(main())
